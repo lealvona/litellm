@@ -452,6 +452,11 @@ def _override_openai_response_model(
                 requested_model,
                 downstream_model,
             )
+        # Preserve the actual downstream model for x-litellm-downstream-model header
+        if downstream_model and downstream_model != requested_model:
+            hidden_params = response_obj.get("_hidden_params")
+            if isinstance(hidden_params, dict):
+                hidden_params["downstream_model"] = downstream_model
         response_obj["model"] = requested_model
         return
 
@@ -471,6 +476,15 @@ def _override_openai_response_model(
             requested_model,
             downstream_model,
         )
+
+    # Preserve the actual downstream model for x-litellm-downstream-model header
+    if downstream_model and downstream_model != requested_model:
+        try:
+            hp = getattr(response_obj, "_hidden_params", None)
+            if isinstance(hp, dict):
+                hp["downstream_model"] = downstream_model
+        except Exception:
+            pass
 
     try:
         setattr(response_obj, "model", requested_model)
@@ -646,6 +660,9 @@ class ProxyBaseLLMRequestProcessing:
                 else None
             ),
             "x-litellm-timeout": str(timeout) if timeout is not None else None,
+            "x-litellm-downstream-model": (
+                hidden_params.get("downstream_model", None)
+            ),
             **{k: str(v) for k, v in kwargs.items()},
         }
         if request_data:
