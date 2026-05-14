@@ -68,6 +68,28 @@ def test_get_metadata_for_health_check_call():
     assert result["tags"][0] == LITTELM_INTERNAL_HEALTH_SERVICE_ACCOUNT_NAME
 
 
+@pytest.mark.asyncio
+async def test_responses_health_check_uses_message_array_input():
+    """Responses mode health checks should use message-list input, not a bare string."""
+    model_params = {"model": "openai/gpt-4o-mini", "api_key": "test-key"}
+
+    with patch("litellm.aresponses", new_callable=AsyncMock) as mock_aresponses:
+        handlers = HealthCheckHelpers.get_mode_handlers(
+            model="openai/gpt-4o-mini",
+            custom_llm_provider="openai",
+            model_params=model_params,
+            prompt="health ping",
+        )
+
+        await handlers["responses"]()
+
+    mock_aresponses.assert_awaited_once_with(
+        model="openai/gpt-4o-mini",
+        api_key="test-key",
+        input=[{"role": "user", "content": "health ping"}],
+    )
+
+
 def test_get_litellm_internal_health_check_user_api_key_auth():
     """Test get_litellm_internal_health_check_user_api_key_auth returns properly configured UserAPIKeyAuth object."""
     result = UserAPIKeyAuth.get_litellm_internal_health_check_user_api_key_auth()
