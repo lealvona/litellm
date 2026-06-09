@@ -473,6 +473,13 @@ def _override_openai_response_model(
                 requested_model,
                 downstream_model,
             )
+        # ADDITIVE (lealvona): stash the real backend model so it can be surfaced
+        # via the x-litellm-downstream-model header. Does NOT replace upstream's
+        # requested-model override below — it only annotates _hidden_params.
+        if downstream_model and downstream_model != requested_model:
+            _hp = response_obj.get("_hidden_params")
+            if isinstance(_hp, dict):
+                _hp["downstream_model"] = downstream_model
         response_obj["model"] = requested_model
         return
 
@@ -492,6 +499,16 @@ def _override_openai_response_model(
             requested_model,
             downstream_model,
         )
+
+    # ADDITIVE (lealvona): stash the real backend model for the
+    # x-litellm-downstream-model header (additive; does not replace the override).
+    if downstream_model and downstream_model != requested_model:
+        try:
+            _hp = getattr(response_obj, "_hidden_params", None)
+            if isinstance(_hp, dict):
+                _hp["downstream_model"] = downstream_model
+        except Exception:
+            pass
 
     try:
         setattr(response_obj, "model", requested_model)
@@ -615,6 +632,9 @@ class ProxyBaseLLMRequestProcessing:
             "x-litellm-model-api-base": (
                 api_base.split("?")[0] if api_base else None
             ),  # don't include query params, risk of leaking sensitive info
+            # ADDITIVE (lealvona): the real backend model behind a router/alias,
+            # complementing upstream's x-litellm-model-id / -api-base / -model-group.
+            "x-litellm-downstream-model": hidden_params.get("downstream_model", None),
             "x-litellm-version": version,
             "x-litellm-model-region": model_region,
             "x-litellm-response-cost": str(response_cost),
@@ -1255,6 +1275,23 @@ class ProxyBaseLLMRequestProcessing:
             ) or self._is_streaming_response(
                 response
             ):  # use generate_responses to stream responses
+                # ADDITIVE (lealvona): surface the real backend model on STREAMING
+                # responses too. The non-streaming path stashes downstream_model in
+                # _override_openai_response_model, but streams build headers here from
+                # the wrapper's _hidden_params before any restamp — so derive it from
+                # the stream wrapper / routed deployment. Best-effort; never raises.
+                if "downstream_model" not in hidden_params:
+                    try:
+                        _requested = self.data.get("model")
+                        _ds = getattr(response, "model", None)
+                        if not _ds or _ds == _requested:
+                            _dep = self.data.get("deployment")
+                            _lp = getattr(_dep, "litellm_params", None)
+                            _ds = getattr(_lp, "model", None) if _lp is not None else None
+                        if _ds and _requested and _ds != _requested:
+                            hidden_params["downstream_model"] = _ds
+                    except Exception:
+                        pass
                 custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
                     user_api_key_dict=user_api_key_dict,
                     call_id=logging_obj.litellm_call_id,
