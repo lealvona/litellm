@@ -4352,3 +4352,83 @@ class TestResponseCostHeaderForTypedDictResponses:
 
         assert "x-litellm-response-cost" not in fastapi_response.headers
         recompute.assert_not_called()
+class TestDownstreamModelHeader:
+    """ADDITIVE (lealvona): coverage for the x-litellm-downstream-model header,
+    which exposes the real backend model behind a router/alias. Pure addition on
+    top of upstream's header/alias handling."""
+
+    def test_get_custom_headers_includes_downstream_model_when_present(self):
+        user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        user_api_key_dict.spend = 0.0
+        user_api_key_dict.tpm_limit = None
+        user_api_key_dict.rpm_limit = None
+        user_api_key_dict.max_budget = None
+
+        headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
+            user_api_key_dict=user_api_key_dict,
+            hidden_params={"downstream_model": "openai/gpt-4o-mini"},
+            request_data=None,
+        )
+
+        assert headers["x-litellm-downstream-model"] == "openai/gpt-4o-mini"
+
+    def test_get_custom_headers_omits_downstream_model_when_absent(self):
+        user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+        user_api_key_dict.spend = 0.0
+        user_api_key_dict.tpm_limit = None
+        user_api_key_dict.rpm_limit = None
+        user_api_key_dict.max_budget = None
+
+        headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
+            user_api_key_dict=user_api_key_dict,
+            hidden_params={},
+            request_data=None,
+        )
+
+        assert "x-litellm-downstream-model" not in headers
+
+    def test_override_model_stashes_downstream_model_for_dict_response(self):
+        requested_model = "smart-router"
+        downstream_model = "openai/gpt-4o-mini"
+        hidden_params = {}
+        response_obj = {"model": downstream_model, "_hidden_params": hidden_params}
+
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+
+        assert response_obj["model"] == requested_model
+        assert hidden_params["downstream_model"] == downstream_model
+
+    def test_override_model_does_not_stash_downstream_model_when_models_match_dict(self):
+        requested_model = "smart-router"
+        hidden_params = {}
+        response_obj = {"model": requested_model, "_hidden_params": hidden_params}
+
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+
+        assert response_obj["model"] == requested_model
+        assert "downstream_model" not in hidden_params
+
+    def test_override_model_stashes_downstream_model_for_object_response(self):
+        requested_model = "smart-router"
+        downstream_model = "openai/gpt-4o-mini"
+        hidden_params = {"additional_headers": {}}
+        response_obj = MagicMock()
+        response_obj.model = downstream_model
+        response_obj._hidden_params = hidden_params
+
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model=requested_model,
+            log_context="test_context",
+        )
+
+        assert response_obj.model == requested_model
+        assert hidden_params["downstream_model"] == downstream_model
