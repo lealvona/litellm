@@ -124,3 +124,15 @@ crash.*.log
 # and should be committed.
 .vscode
 .pin_list.txt
+
+# ── lealvona local ops (NEVER push: config/notes/creds/research) ──
+proxy_config.yaml
+proxy_config.yaml.*
+proxy_minimal.yaml
+start-proxy.sh
+scripts/bootstrap_db_models.py
+scripts/backoff_quarantine.py
+local-notes/
+litellm.db
+backups/
+dist/
