@@ -2783,3 +2783,93 @@ def test_reasoning_items_streaming_emitted_on_response_completed():
         ri["encrypted_content"] == encrypted
     ), "encrypted_content must be preserved in streaming"
     assert ri["summary"][0]["text"] == summary_text
+
+
+def test_assistant_content_alongside_tool_calls_is_preserved():
+    """
+    Regression test: assistant text that accompanies tool_calls must be
+    replayed to the Responses API as a message item, not silently dropped.
+
+    Agentic frameworks send histories like:
+        assistant: {"content": "Checking disk space now.", "tool_calls": [...]}
+    Dropping the content makes the model blind to its own prior commentary,
+    so it re-states the same status preamble on every tool iteration.
+    """
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        LiteLLMResponsesTransformationHandler,
+    )
+
+    handler = LiteLLMResponsesTransformationHandler()
+
+    messages = [
+        {"role": "user", "content": "Check the disk space please."},
+        {
+            "role": "assistant",
+            "content": "Checking disk space now with df.",
+            "tool_calls": [
+                {
+                    "id": "call_df1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": '{"command": "df -h"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_df1", "content": "40% used"},
+    ]
+
+    input_items, _ = handler.convert_chat_completion_messages_to_responses_api(messages)
+
+    assistant_msg_idx = None
+    function_call_idx = None
+    for i, item in enumerate(input_items):
+        if item.get("type") == "message" and item.get("role") == "assistant":
+            assistant_msg_idx = i
+        elif item.get("type") == "function_call" and item.get("call_id") == "call_df1":
+            function_call_idx = i
+
+    assert assistant_msg_idx is not None, (
+        "assistant content alongside tool_calls was dropped from input items"
+    )
+    content = input_items[assistant_msg_idx]["content"]
+    assert content[0]["type"] == "output_text"
+    assert content[0]["text"] == "Checking disk space now with df."
+
+    assert function_call_idx is not None, "function_call item missing"
+    assert assistant_msg_idx < function_call_idx, (
+        "assistant message must precede its function_call items"
+    )
+
+
+def test_assistant_empty_content_with_tool_calls_emits_no_message_item():
+    """Empty/None assistant content with tool_calls must not emit an empty message item."""
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        LiteLLMResponsesTransformationHandler,
+    )
+
+    handler = LiteLLMResponsesTransformationHandler()
+
+    for empty in (None, ""):
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": empty,
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "t", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_x", "content": "ok"},
+        ]
+        input_items, _ = handler.convert_chat_completion_messages_to_responses_api(messages)
+        assistant_messages = [
+            it
+            for it in input_items
+            if it.get("type") == "message" and it.get("role") == "assistant"
+        ]
+        assert assistant_messages == [], (
+            f"empty content {empty!r} should not produce a message item"
+        )
