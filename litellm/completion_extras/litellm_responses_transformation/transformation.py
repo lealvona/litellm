@@ -279,6 +279,21 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             elif role == "assistant" and tool_calls and isinstance(tool_calls, list):
                 for r_item in _get_reasoning_items(msg):
                     input_items.append(_reasoning_item_to_response_input(r_item))
+                # Preserve assistant text that accompanies tool calls (e.g.
+                # status preambles). Dropping it makes the model blind to its
+                # own prior commentary on replay, so it re-states it on every
+                # tool iteration.
+                if content:
+                    input_items.append(
+                        {
+                            "type": "message",
+                            "role": role,
+                            "content": self._convert_content_to_responses_format(
+                                content,  # type: ignore[arg-type]
+                                cast(str, role),
+                            ),
+                        }
+                    )
                 for tool_call in tool_calls:
                     function = tool_call.get("function")
                     if function:
