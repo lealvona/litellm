@@ -130,27 +130,36 @@ class AutoRouter(CustomLogger):
             # do nothing, return same inputs
             return None
 
-        if self.routelayer is None:
-            #######################
-            # Create the route layer
-            #######################
-            self.routelayer = SemanticRouter(
-                routes=self.loaded_routes,
-                encoder=LiteLLMRouterEncoder(
-                    litellm_router_instance=self.litellm_router_instance,
-                    model_name=self.embedding_model,
-                ),
-                auto_sync=self.auto_sync_value,
-            )
+        route_choice: Optional[Union[RouteChoice, List[RouteChoice]]] = None
+        try:
+            if self.routelayer is None:
+                #######################
+                # Create the route layer
+                #######################
+                self.routelayer = SemanticRouter(
+                    routes=self.loaded_routes,
+                    encoder=LiteLLMRouterEncoder(
+                        litellm_router_instance=self.litellm_router_instance,
+                        model_name=self.embedding_model,
+                    ),
+                    auto_sync=self.auto_sync_value,
+                )
 
-        message_content = self._extract_text_from_messages(messages)
-        route_choice: Optional[Union[RouteChoice, List[RouteChoice]]] = self.routelayer(
-            text=message_content
-        )
+            message_content = self._extract_text_from_messages(messages)
+            route_choice = self.routelayer(text=message_content)
+        except Exception as e:
+            # Routing must never leak the raw auto_router/* deployment to the
+            # provider layer (-> "Unmapped LLM provider"). Any failure here
+            # (e.g. embedding endpoint hiccup) resolves to the default model.
+            verbose_router_logger.warning(
+                f"auto_router: semantic routing failed ({e}); "
+                f"using default model {self.default_model}"
+            )
         verbose_router_logger.debug(f"route_choice: {route_choice}")
+        model = self.default_model
         if isinstance(route_choice, RouteChoice):
             model = route_choice.name or self.default_model
-        elif isinstance(route_choice, list):
+        elif isinstance(route_choice, list) and route_choice:
             model = route_choice[0].name or self.default_model
 
         return PreRoutingHookResponse(
