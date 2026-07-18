@@ -136,3 +136,7 @@ local-notes/
 litellm.db
 backups/
 dist/
+
+# editor/agent backups — never push (may carry old secrets/config)
+*.bak
+*.bak.*

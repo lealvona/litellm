@@ -2,10 +2,17 @@
 Auto-Routing Strategy that works with a Semantic Router Config
 """
 
+import asyncio
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger
+
+# Hard wall-clock budget for the semantic-routing embedding (init + query),
+# lealvona 2026-07-17. Healthy is ~27ms/query; a dead embedder must degrade to
+# the default model within this, never wedge the router. Env-tunable.
+_AUTOROUTER_TIMEOUT = float(os.environ.get("LITELLM_AUTOROUTER_TIMEOUT", "6.0"))
 
 if TYPE_CHECKING:
     from semantic_router.routers.base import Route
@@ -105,6 +112,30 @@ class AutoRouter(CustomLogger):
                 return str(content)
         return ""
 
+    def _route_sync(self, text: str):
+        """Synchronous routing: lazily builds the SemanticRouter (embeds every
+        route utterance on first use) then embeds ``text`` and returns the route
+        choice. Both are blocking embedding calls, so this is always invoked via
+        asyncio.to_thread + asyncio.wait_for (see async_pre_routing_hook) — that
+        keeps the proxy event loop responsive and bounds a hung embedder so
+        routing degrades to the default model instead of wedging the fleet."""
+        from semantic_router.routers import SemanticRouter
+
+        from litellm.router_strategy.auto_router.litellm_encoder import (
+            LiteLLMRouterEncoder,
+        )
+
+        if self.routelayer is None:
+            self.routelayer = SemanticRouter(
+                routes=self.loaded_routes,
+                encoder=LiteLLMRouterEncoder(
+                    litellm_router_instance=self.litellm_router_instance,
+                    model_name=self.embedding_model,
+                ),
+                auto_sync=self.auto_sync_value,
+            )
+        return self.routelayer(text=text)
+
     async def async_pre_routing_hook(
         self,
         model: str,
@@ -130,37 +161,61 @@ class AutoRouter(CustomLogger):
             # do nothing, return same inputs
             return None
 
+        # Route the request under a hard wall-clock bound, OFF the event loop.
+        # Both SemanticRouter init (embeds every route utterance) and __call__
+        # (embeds the query) are SYNCHRONOUS embedding calls; running them inline
+        # blocks the ENTIRE proxy event loop, so a dead/slow embedder wedged
+        # every routed request for 50-125s (2026-07-15/17). to_thread frees the
+        # loop; wait_for guarantees we fall through to the default model within
+        # _AUTOROUTER_TIMEOUT instead of hanging.
+        model = self.default_model
         route_choice: Optional[Union[RouteChoice, List[RouteChoice]]] = None
         try:
-            if self.routelayer is None:
-                #######################
-                # Create the route layer
-                #######################
-                self.routelayer = SemanticRouter(
-                    routes=self.loaded_routes,
-                    encoder=LiteLLMRouterEncoder(
-                        litellm_router_instance=self.litellm_router_instance,
-                        model_name=self.embedding_model,
-                    ),
-                    auto_sync=self.auto_sync_value,
-                )
-
             message_content = self._extract_text_from_messages(messages)
-            route_choice = self.routelayer(text=message_content)
+            route_choice = await asyncio.wait_for(
+                asyncio.to_thread(self._route_sync, message_content),
+                timeout=_AUTOROUTER_TIMEOUT,
+            )
         except Exception as e:
-            # Routing must never leak the raw auto_router/* deployment to the
-            # provider layer (-> "Unmapped LLM provider"). Any failure here
-            # (e.g. embedding endpoint hiccup) resolves to the default model.
             verbose_router_logger.warning(
-                f"auto_router: semantic routing failed ({e}); "
+                f"auto_router: semantic routing failed/timed out ({e}); "
                 f"using default model {self.default_model}"
             )
         verbose_router_logger.debug(f"route_choice: {route_choice}")
-        model = self.default_model
         if isinstance(route_choice, RouteChoice):
             model = route_choice.name or self.default_model
         elif isinstance(route_choice, list) and route_choice:
             model = route_choice[0].name or self.default_model
+
+        # --- thinking-toggle injection (Phase B, lealvona 2026-06-23) ------
+        # Translate any reasoning_effort signal on the request into the CHOSEN
+        # model's native thinking param via extra_body, POST-routing.
+        # request_kwargs is the live completion-call dict (same object used
+        # downstream at router.py async_get_healthy_deployments / acompletion;
+        # cf. QualityRouter which stashes its decision here and reads it
+        # post-response), so extra_body injected here reaches the deployment
+        # call and survives the proxy's drop_params:true.
+        # Best-effort: an import/translation failure must NEVER break routing.
+        try:
+            try:
+                import thinking_control as _tc
+            except ImportError:
+                # Out-of-tree patch module; when the proxy runs from an installed
+                # copy (not the repo), point LITELLM_PATCH_DIR at the checkout that
+                # holds thinking_control.py. No path is hardcoded here.
+                _p = os.environ.get("LITELLM_PATCH_DIR")
+                if _p:
+                    import sys as _sys
+                    if _p not in _sys.path:
+                        _sys.path.insert(0, _p)
+                import thinking_control as _tc
+            if isinstance(request_kwargs, dict):
+                _st, _ef = _tc._norm(request_kwargs.get("reasoning_effort"))
+                if _st is not None:
+                    _tc.apply_thinking(request_kwargs, _st, _ef, model=model)
+        except Exception:
+            pass
+        # ------------------------------------------------------------------
 
         return PreRoutingHookResponse(
             model=model,
