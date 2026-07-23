@@ -132,3 +132,15 @@ crash.*.log
 .coverage
 
 ui/litellm-dashboard/out/
+proxy_config.yaml
+proxy_config.yaml.*
+proxy_minimal.yaml
+start-proxy.sh
+scripts/bootstrap_db_models.py
+scripts/backoff_quarantine.py
+local-notes/
+litellm.db
+backups/
+dist/
+*.bak
+*.bak.*
