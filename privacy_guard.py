@@ -8,18 +8,31 @@ the sensitive data never reaches a cloud provider. Non-matching requests pass
 through unchanged → normal cloud semantic routing.
 
 Design guarantees:
-- ONE-WAY FUSE: once a conversation has been routed local (PII seen), it is
-  LATCHED local for all future turns — even if later turns are benign and even
-  if the original PII has aged out of the context via compression. Cloud→local
-  is allowed (PII appearing mid-conversation); local→cloud is impossible.
-  The latch is keyed by a stable conversation fingerprint (caller session id if
-  present, else a hash of the compression-protected first user message) and
-  persisted to disk so it survives proxy restarts.
+- CONFIGURABLE STICKINESS: ``fuse_mode=context`` scans the complete payload on
+  every request and permits cloud routing again once sensitive text is no longer
+  being sent (for example, after context compression). ``fuse_mode=permanent``
+  retains the legacy one-way, disk-persisted conversation latch.
 - STICKY scan: evaluates every message, so PII anywhere trips the fuse.
 - FAIL-SAFE: any error → route local (never leak on uncertainty).
 - DATA-DRIVEN: rules in privacy_rules.json (admin UI on :8094); hot-reloaded.
+- ROLE-AWARE NUMERIC PII: ambiguous unformatted numbers in machine-generated
+  tool output are not treated as phone numbers, while user-authored numbers and
+  formatted phone numbers remain protected. Date-stamped technical identifiers
+  are not treated as payment-card numbers merely because they pass Luhn.
+- ROLE-AWARE EMAIL PII: user-authored email addresses remain protected. Bare
+  addresses found only in machine-generated tool output do not force an entire
+  documentation/repository turn local; explicit personal-mail intent in the
+  user message still trips the separate ``personal_mail`` rule.
 - PRIVACY-PRESERVING LOGS: decision log records matched-rule + routed-model +
   text length only — never the content itself.
+
+- CONTEXT COMPACTION: a Hermes compaction request arrives as one giant
+  machine-built user message, so scanning it raw would destroy every role-aware
+  exemption above and let the guard trip on its own instruction text. The
+  compressor fences the material it is summarizing; this module unwraps the
+  fence and restores each turn's original role, so a compaction inherits the
+  SAME routing decision the conversation itself would get. An unfenced payload
+  is scanned whole — which routes local, the fail-safe direction.
 
 ``evaluate(messages)`` is importable so the admin UI tests the exact same logic.
 """
@@ -54,6 +67,7 @@ _DEFAULT_RULES: Dict[str, Any] = {
     "enabled": True,
     "router_name": "smart-router",
     "local_model": os.environ.get("PRIVACY_GUARD_LOCAL_MODEL", ""),
+    "fuse_mode": "permanent",
     "regex_rules": [
         {"id": "email", "label": "Email", "pattern": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "enabled": True},
         {"id": "api_secret_key", "label": "API key", "pattern": r"\b(?:sk|rk|pk)-[A-Za-z0-9_]{16,}\b", "enabled": True},
@@ -140,9 +154,46 @@ class _Rules:
         return self.raw.get("router_name", "smart-router")
 
     @property
+    def router_names(self) -> Tuple[str, ...]:
+        """Every model name that should be privacy-routed.
+
+        ``router_names`` (list) is preferred; ``router_name`` (str) stays
+        supported so an existing rules file keeps working untouched.
+        """
+        raw = self.raw.get("router_names")
+        if isinstance(raw, list):
+            names = tuple(str(n).strip() for n in raw if str(n).strip())
+            if names:
+                return names
+        return (self.router_name,)
+
+    @property
+    def compression_router(self) -> str:
+        """Model name Hermes calls for context compaction, or "" to disable.
+
+        Empty means the compaction endpoint is not managed here and whatever
+        the proxy config points it at (a local model) is used unconditionally.
+        """
+        return str(self.raw.get("compression_router", "") or "").strip()
+
+    @property
+    def compression_cloud_model(self) -> str:
+        """Summarizer used when a compaction payload carries nothing sensitive.
+
+        Empty keeps compaction local even on a clean payload.
+        """
+        return str(self.raw.get("compression_cloud_model", "") or "").strip()
+
+    @property
     def local_model(self) -> str:
         env_default = os.environ.get("PRIVACY_GUARD_LOCAL_MODEL", "")
         return self.raw.get("local_model") or env_default
+
+    @property
+    def fuse_mode(self) -> str:
+        """Return ``context`` or the fail-safe legacy ``permanent`` mode."""
+        mode = str(self.raw.get("fuse_mode", "permanent")).strip().lower()
+        return "context" if mode == "context" else "permanent"
 
 
 _RULES = _Rules()
@@ -219,39 +270,238 @@ def _trip(key: str) -> None:
         pass
 
 
+def _message_text(message: Dict[str, Any]) -> str:
+    c = message.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(
+            str(b.get("text", ""))
+            for b in c
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
 def _all_text(messages: Optional[List[Dict[str, Any]]]) -> str:
     parts: List[str] = []
     for m in messages or []:
-        c = m.get("content")
-        if isinstance(c, str):
-            parts.append(c)
-        elif isinstance(c, list):
-            for b in c:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    parts.append(str(b.get("text", "")))
+        text = _message_text(m)
+        if text:
+            parts.append(text)
     return "\n".join(parts)
 
 
-def evaluate(messages: Optional[List[Dict[str, Any]]]) -> Tuple[bool, Optional[str]]:
+# ── Hermes context-compaction fence ──────────────────────────────────────
+# A compaction request is a single machine-built user message: instruction
+# scaffolding wrapped around role-labelled conversation material. Scanning it
+# raw is wrong twice over — every tool-output address and build identifier
+# would read as user-authored, and the guard would trip on its own instruction
+# text. The compressor fences the material; the ``[ROLE]:`` labels inside
+# restore the roles, so the compaction gets the same decision as the turn.
+MATERIAL_BEGIN = "=== BEGIN CONVERSATION MATERIAL"
+MATERIAL_END = "=== END CONVERSATION MATERIAL ==="
+
+# Each fence declares what it holds, because the answer changes how it grades:
+#   transcript — real turns, keeps its [ROLE]: labels
+#   summary    — machine-written and already scrubbed of personal data, so it
+#                is graded as tool output. Grading it strictly would pin every
+#                later compaction local on nothing worse than a ten-digit
+#                build id, which is exactly the kind of value a summary is
+#                supposed to carry forward.
+#   anything else (memory, focus, or an unlabelled fence) — graded strictly.
+_MATERIAL_RE = re.compile(
+    re.escape(MATERIAL_BEGIN) + r"(?::[ \t]*([a-z]+))?[ \t]*===\n?(.*?)\n?"
+    + re.escape(MATERIAL_END),
+    re.DOTALL,
+)
+_MACHINE_WRITTEN_KINDS = frozenset({"summary"})
+# Labels emitted by the compressor's serializer: [USER]:, [ASSISTANT]:,
+# [TOOL RESULT <id>]:, [SYSTEM]:, [INTERNAL CONTEXT]:.
+_TRANSCRIPT_LABEL_RE = re.compile(
+    r"^\[(USER|ASSISTANT|SYSTEM|INTERNAL CONTEXT|TOOL(?:\s+RESULT[^\]]*)?)\]:[ \t]?",
+    re.MULTILINE,
+)
+_LABEL_ROLES = {
+    "USER": "user",
+    "ASSISTANT": "assistant",
+    "SYSTEM": "system",
+    # Synthetic turns the agent writes to itself — machine-generated, but
+    # graded strictly rather than as tool output because their text is
+    # assembled from the conversation.
+    "INTERNAL CONTEXT": "assistant",
+}
+
+
+def _transcript_segments(block: str, kind: str = "") -> List[Tuple[str, str]]:
+    """Split one fenced block back into ``(role, text)`` turns.
+
+    A block with no ``[ROLE]:`` labels grades as ``user`` — the strict path —
+    unless it declares itself machine-written, because derived text otherwise
+    carries whatever the conversation carried.
+    """
+    matches = list(_TRANSCRIPT_LABEL_RE.finditer(block))
+    if not matches:
+        default_role = "tool" if kind in _MACHINE_WRITTEN_KINDS else "user"
+        return [(default_role, block)]
+    segments: List[Tuple[str, str]] = []
+    head = block[: matches[0].start()]
+    if head.strip():
+        segments.append(("user", head))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(block)
+        label = (m.group(1) or "").strip().upper()
+        role = "tool" if label.startswith("TOOL") else _LABEL_ROLES.get(label, "user")
+        body = block[m.end(): end]
+        if body.strip():
+            segments.append((role, body))
+    return segments
+
+
+def compaction_messages(text: str) -> Optional[List[Dict[str, Any]]]:
+    """Rebuild role-attributed messages from a fenced compaction prompt.
+
+    Returns ``None`` when no fence is present, so the caller falls back to
+    scanning the whole request — stricter, never looser.
+    """
+    blocks = _MATERIAL_RE.findall(text or "")
+    if not blocks:
+        return None
+    messages: List[Dict[str, Any]] = []
+    for kind, block in blocks:
+        for role, body in _transcript_segments(block, (kind or "").strip().lower()):
+            messages.append({"role": role, "content": body})
+    return messages
+
+
+_PHONE_CONTEXT_RE = re.compile(
+    r"\b(?:phone|telephone|mobile|cell|tel|sms|call|text(?:ing)?|whatsapp|signal)\b",
+    re.IGNORECASE,
+)
+_TECHNICAL_DATE_ID_RE = re.compile(r"^\d{8}[-_]\d{6}$")
+_SECRET_ASSIGNMENT_VALUE_RE = re.compile(
+    r"\b(?:password|passwd|passphrase|secret|api[_ ]?key|access[_ ]?token|auth[_ ]?token|private[_ ]?key)\b"
+    r"\s*(?:is|are|=|:)\s*(?P<value>\S+)",
+    re.IGNORECASE,
+)
+
+
+# Roles whose text a MODEL wrote rather than a person. Only ``tool`` counts by
+# default, which is right for a normal turn: the assistant messages there are
+# the live conversation. Inside a COMPACTION payload the assistant turns are
+# equally machine-generated transcript, and grading them as human authored
+# meant a ten-digit build id quoted back by the assistant read as a phone
+# number — enough to pin every compaction of a long technical conversation to
+# the local model. Callers opt in; nothing changes for ordinary requests.
+DEFAULT_MACHINE_ROLES: Tuple[str, ...] = ("tool",)
+TRANSCRIPT_MACHINE_ROLES: Tuple[str, ...] = ("tool", "assistant", "system")
+
+
+def _accept_regex_match(
+    rule_id: str,
+    match: "re.Match[str]",
+    text: str,
+    role: str,
+    machine_roles: Tuple[str, ...] = DEFAULT_MACHINE_ROLES,
+) -> bool:
+    """Reject high-confidence numeric false positives without weakening secrets.
+
+    Ten contiguous digits are common in timestamps, counters, ROM metadata, and
+    JSON tool output. Treat them as a phone number when a human authored the
+    message, when formatting makes the intent clear, or when nearby text says it
+    is a phone-like value. Tool output otherwise needs stronger evidence.
+
+    A compact ``YYYYMMDD-HHMMSS`` identifier can accidentally pass Luhn. It is a
+    date-stamped technical id, not a payment card; every other Luhn-valid card
+    candidate remains protected.
+    """
+    candidate = match.group(0)
+    if rule_id == "email":
+        # Documentation, source trees, and command output routinely contain
+        # public maintainer/support addresses. Routing a 100K tool result local
+        # because of one such address defeats the cloud router and caused a live
+        # gpt-5.5 turn to fall back to llm_115. Protect user-authored addresses;
+        # for private inbox workflows the user-side ``personal_mail`` phrase
+        # rule trips before tool output is sent onward.
+        if role in machine_roles:
+            return False
+    if rule_id == "phone":
+        if role not in machine_roles:
+            return True
+        if re.search(r"[^\d]", candidate):
+            return True
+        context = text[max(0, match.start() - 48): match.end() + 48]
+        return bool(_PHONE_CONTEXT_RE.search(context))
+    if rule_id == "credit_card":
+        compact = candidate.replace(" ", "")
+        if _TECHNICAL_DATE_ID_RE.fullmatch(compact):
+            return False
+    return True
+
+
+def _accept_phrase_match(
+    rule_id: str,
+    match: "re.Match[str]",
+    text: str,
+    role: str,
+    machine_roles: Tuple[str, ...] = DEFAULT_MACHINE_ROLES,
+) -> bool:
+    """Distinguish secret values from non-secret references in machine text."""
+    if rule_id != "secret_assignment" or role not in machine_roles:
+        return True
+    assignment = _SECRET_ASSIGNMENT_VALUE_RE.match(text, match.start())
+    if assignment is None:
+        return True
+    value = assignment.group("value").strip("'\"`,;)")
+    low = value.lower()
+    is_path = bool(
+        value.startswith(("/", "~/", "./", "../", "\\\\"))
+        or re.match(r"^[A-Za-z]:[\\/]", value)
+    )
+    is_reference = bool(
+        value.startswith(("$", "${", "os.environ/", "os.environ["))
+        or low.startswith(("env:", "secret://", "vault://"))
+        or re.match(r"^\{[A-Za-z_][A-Za-z0-9_]*\}(?:[/\\]|$)", value)
+        or re.match(r"^%[A-Za-z_][A-Za-z0-9_]*%(?:[/\\]|$)", value)
+    )
+    is_placeholder = bool(
+        low in {"none", "null", "unset", "missing", "redacted", "true", "false"}
+        or value.startswith(("<", "[REDACTED]", "***"))
+    )
+    return not (is_path or is_reference or is_placeholder)
+
+
+def evaluate(
+    messages: Optional[List[Dict[str, Any]]],
+    machine_roles: Tuple[str, ...] = DEFAULT_MACHINE_ROLES,
+) -> Tuple[bool, Optional[str]]:
     """Return (is_sensitive, matched_rule_id). Used by the hook AND the admin UI."""
     _RULES.load()
     if not _RULES.enabled:
         return (False, None)
-    text = _all_text(messages)
-    if not text:
+    message_texts = [
+        (str(message.get("role") or ""), _message_text(message))
+        for message in messages or []
+    ]
+    message_texts = [(role, text) for role, text in message_texts if text]
+    if not message_texts:
         return (False, None)
-    low = text.lower()
-    for rid, pat, luhn in _RULES.regex:
-        m = pat.search(text)
-        if m and (not luhn or _luhn_ok(m.group(0))):
-            return (True, rid)
-    for rid, pat in _RULES.phrase:
-        if pat.search(low):
-            return (True, rid)
-    for rid, terms in _RULES.keyword:
-        for t in terms:
-            if t and t in low:
-                return (True, rid)
+    for role, text in message_texts:
+        low = text.lower()
+        for rid, pat, luhn in _RULES.regex:
+            for match in pat.finditer(text):
+                if luhn and not _luhn_ok(match.group(0)):
+                    continue
+                if _accept_regex_match(rid, match, text, role, machine_roles):
+                    return (True, rid)
+        for rid, pat in _RULES.phrase:
+            for match in pat.finditer(low):
+                if _accept_phrase_match(rid, match, text, role, machine_roles):
+                    return (True, rid)
+        for rid, terms in _RULES.keyword:
+            for term in terms:
+                if term and term in low:
+                    return (True, rid)
     return (False, None)
 
 
@@ -259,12 +509,18 @@ def evaluate_text(text: str) -> Tuple[bool, Optional[str]]:
     return evaluate([{"role": "user", "content": text or ""}])
 
 
-def _log_decision(rule_id: Optional[str], routed_model: str, text_len: int, note: str = "") -> None:
+def _log_decision(
+    rule_id: Optional[str],
+    routed_model: str,
+    text_len: int,
+    note: str = "",
+    routed_local: bool = True,
+) -> None:
     try:
         os.makedirs(os.path.dirname(DECISIONS_LOG), exist_ok=True)
         rec = {
             "ts": time.time(),
-            "routed_local": True,
+            "routed_local": routed_local,
             "rule": rule_id,
             "model": routed_model,
             "chars": text_len,
@@ -277,29 +533,90 @@ def _log_decision(rule_id: Optional[str], routed_model: str, text_len: int, note
 
 
 class PrivacyGuard(CustomLogger):
+    def _handle_compaction(self, data: Dict[str, Any], messages: Any) -> Dict[str, Any]:
+        """Route a context-compaction call the way its own material grades.
+
+        Compaction is where a conversation's sensitive text would otherwise
+        leak wholesale: the summarizer is handed the entire middle of the
+        transcript at once. So it gets the same verdict the conversation gets
+        — local while sensitive material is still present, the cloud
+        summarizer once it is not. Because the compaction prompt instructs the
+        summarizer to redact, a context normally clears itself after one local
+        pass and later compactions run on the faster model.
+
+        The permanent-fuse mode never promotes: a latched conversation is
+        pinned local by definition, and a compaction is not the place to
+        relitigate that.
+        """
+        local_model = _RULES.local_model
+        payload_len = len(_all_text(messages))
+        if _RULES.fuse_mode == "permanent":
+            data["model"] = local_model
+            _log_decision("fuse", local_model, payload_len, note="task:compaction")
+            return data
+        fenced = compaction_messages(_all_text(messages))
+        if fenced is not None:
+            sensitive, rule_id = evaluate(fenced, TRANSCRIPT_MACHINE_ROLES)
+        else:
+            sensitive, rule_id = evaluate(messages)
+        cloud_model = _RULES.compression_cloud_model
+        if sensitive or not cloud_model:
+            data["model"] = local_model
+            _log_decision(
+                rule_id,
+                local_model,
+                payload_len,
+                note="task:compaction fenced:%s" % ("yes" if fenced is not None else "no"),
+            )
+            return data
+        data["model"] = cloud_model
+        _log_decision(
+            None,
+            cloud_model,
+            payload_len,
+            note="task:compaction clean",
+            routed_local=False,
+        )
+        return data
+
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):  # noqa: ANN001
         try:
             _RULES.load()
-            if data.get("model") != _RULES.router_name:
+            requested = data.get("model")
+            compaction_router = _RULES.compression_router
+            if compaction_router and requested == compaction_router:
+                return self._handle_compaction(data, data.get("messages"))
+            if requested not in _RULES.router_names:
                 return data  # only intercept the router; direct model calls pass through
             local_model = _RULES.local_model
             messages = data.get("messages")
             key = _conversation_key(data, messages)
-            # ── FUSE: a conversation already routed local stays local forever.
-            if key and key in _FUSED:
+            # The legacy permanent fuse is opt-in. Context mode is still sticky
+            # across the entire payload, but does not pin a conversation local
+            # after sensitive text has left the request.
+            permanent_fuse = _RULES.fuse_mode == "permanent"
+            if permanent_fuse and key and key in _FUSED:
                 data["model"] = local_model
                 _log_decision("fuse", local_model, len(_all_text(messages)))
                 return data
             sensitive, rule_id = evaluate(messages)
             if sensitive:
-                if key:
+                if permanent_fuse and key:
                     _trip(key)  # latch — one-way, can never return to cloud
                 data["model"] = local_model
-                _log_decision(rule_id, local_model, len(_all_text(messages)))
+                _log_decision(
+                    rule_id,
+                    local_model,
+                    len(_all_text(messages)),
+                    note=f"fuse_mode:{_RULES.fuse_mode}",
+                )
             return data
         except Exception as e:  # FAIL-SAFE: never leak on uncertainty
             try:
-                if data.get("model") == _RULES.router_name:
+                guarded = set(_RULES.router_names)
+                if _RULES.compression_router:
+                    guarded.add(_RULES.compression_router)
+                if data.get("model") in guarded:
                     data["model"] = _RULES.local_model
                     _log_decision(None, _RULES.local_model, 0, note=f"failsafe:{type(e).__name__}")
             except Exception:
