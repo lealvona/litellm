@@ -1,0 +1,102 @@
+# Generation gateway: cloud image generation (Comfy Cloud, Runware, DeepInfra),
+# text-to-speech (DeepInfra) and an authenticated native Comfy Cloud pass-through.
+#
+# Deliberately a SEPARATE LiteLLM instance from the agent-facing router:
+#   - agent harnesses are never issued a key here, so they cannot discover or
+#     spend on these models;
+#   - every consumer key carries a budget and rate limit (enforced on the real
+#     provider-reported cost — see gen_providers.py);
+#   - restarting this instance never interrupts agent chat streams.
+#
+# Secrets come from the service's environment file; none live in this file.
+# Image models are served on POST /v1/images/generations (OpenAI images API).
+
+model_list:
+  # ---- Comfy Cloud (premier engine): ComfyUI graphs, cost = GPU-seconds ----
+  - model_name: comfy-flux-krea
+    litellm_params: {model: comfycloud/flux-krea, api_key: os.environ/COMFY_CLOUD_API_KEY, rpm: 20}
+    model_info: {mode: image_generation, description: "FLUX.1 Krea dev — photoreal default (26 steps)"}
+  - model_name: comfy-flux2-klein
+    litellm_params: {model: comfycloud/flux2-klein, api_key: os.environ/COMFY_CLOUD_API_KEY, rpm: 20}
+    model_info: {mode: image_generation, description: "FLUX.2 klein 9B — fast 4-step"}
+  - model_name: comfy-flux2-dev
+    litellm_params: {model: comfycloud/flux2-dev, api_key: os.environ/COMFY_CLOUD_API_KEY, rpm: 20}
+    model_info: {mode: image_generation, description: "FLUX.2 dev — highest quality, slowest"}
+  - model_name: comfy-flux-schnell
+    litellm_params: {model: comfycloud/flux-schnell, api_key: os.environ/COMFY_CLOUD_API_KEY, rpm: 20}
+    model_info: {mode: image_generation, description: "FLUX.1 schnell — cheapest Comfy draft"}
+
+  # ---- Runware: task API, exact USD per result ----
+  - model_name: runware-flux-dev
+    litellm_params: {model: "runware/runware:101@1", api_key: os.environ/RUNWARE_API_KEY, rpm: 30}
+    model_info: {mode: image_generation, description: "FLUX.1 dev @ Runware"}
+  - model_name: runware-flux-schnell
+    litellm_params: {model: "runware/runware:100@1", api_key: os.environ/RUNWARE_API_KEY, rpm: 30}
+    model_info: {mode: image_generation, description: "FLUX.1 schnell @ Runware — fractions of a cent"}
+
+  # ---- DeepInfra: native inference route, exact USD per request ----
+  - model_name: deepinfra-flux2-dev
+    litellm_params: {model: deepinfra_native/black-forest-labs/FLUX-2-dev, api_key: os.environ/DEEPINFRA_API_KEY, rpm: 30}
+    model_info: {mode: image_generation, description: "FLUX.2 dev @ DeepInfra (~$0.01/image)"}
+  - model_name: deepinfra-flux2-pro
+    litellm_params: {model: deepinfra_native/black-forest-labs/FLUX-2-pro, api_key: os.environ/DEEPINFRA_API_KEY, rpm: 30}
+    model_info: {mode: image_generation, description: "FLUX.2 pro @ DeepInfra (~$0.015/image)"}
+  - model_name: deepinfra-flux-schnell
+    litellm_params: {model: deepinfra_native/black-forest-labs/FLUX-1-schnell, api_key: os.environ/DEEPINFRA_API_KEY, rpm: 30}
+    model_info: {mode: image_generation, description: "FLUX.1 schnell @ DeepInfra (~$0.0005/image)"}
+  - model_name: deepinfra-qwen-image-max
+    litellm_params: {model: deepinfra_native/Qwen/Qwen-Image-Max, api_key: os.environ/DEEPINFRA_API_KEY, rpm: 10}
+    model_info: {mode: image_generation, description: "Qwen-Image-Max @ DeepInfra — strong text in images (~$0.075/image)"}
+
+  # ---- DeepInfra text-to-speech (OpenAI /v1/audio/speech) ----
+  - model_name: deepinfra-qwen3-tts
+    litellm_params:
+      model: openai/Qwen/Qwen3-TTS
+      api_base: https://api.deepinfra.com/v1/openai
+      api_key: os.environ/DEEPINFRA_API_KEY
+      rpm: 30
+    model_info: {mode: audio_speech, description: "Qwen3-TTS @ DeepInfra ($20 / 1M characters)"}
+  - model_name: deepinfra-kokoro-tts
+    litellm_params:
+      model: openai/hexgrad/Kokoro-82M
+      api_base: https://api.deepinfra.com/v1/openai
+      api_key: os.environ/DEEPINFRA_API_KEY
+      rpm: 30
+    model_info: {mode: audio_speech, description: "Kokoro 82M @ DeepInfra ($0.62 / 1M characters)"}
+
+router_settings:
+  # NEVER retry generation: a retry re-submits a paid job.
+  num_retries: 0
+  allowed_fails: 3
+  cooldown_time: 30
+  timeout: 600
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+  callbacks: ["dunsinane_guard.proxy_handler_instance"]   # log-only attribution, fail-open
+  custom_provider_map:
+    - {provider: comfycloud, custom_handler: gen_providers.comfy_handler}
+    - {provider: runware, custom_handler: gen_providers.runware_handler}
+    - {provider: deepinfra_native, custom_handler: gen_providers.deepinfra_handler}
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: false            # this file is the model source of truth
+  background_health_checks: false     # a health check on a generation model spends money
+  # Native APIs with key custody: callers present a gateway virtual key and never
+  # hold the provider key. NOT cost-tracked (the gateway cannot price arbitrary
+  # graphs/tasks) — only issue pass-through access (allowed_routes) deliberately.
+  # Comfy partner nodes (Kling etc.) need the provider key in the request body,
+  # so they do not work through this route; GPU graphs do.
+  # Keys also need metadata.allowed_passthrough_routes (default-deny).
+  # No Runware pass-through: Runware takes a JSON ARRAY body and LiteLLM's auth
+  # layer assumes an object (AttributeError -> 500). Runware is served through
+  # the images API instead.
+  pass_through_endpoints:
+    - path: "/comfy"
+      target: "https://cloud.comfy.org/api"
+      headers: {X-API-Key: "os.environ/COMFY_CLOUD_API_KEY"}
+      include_subpath: true
+      auth: true
